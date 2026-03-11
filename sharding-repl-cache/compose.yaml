@@ -158,7 +158,7 @@ services:
   pymongo_api:
     container_name: pymongo_api
     build: 
-      context: api_app
+      context: ../api_app
       dockerfile: Dockerfile
     depends_on:
       - mongos_router

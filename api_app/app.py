@@ -1,11 +1,13 @@
 import json
 import logging
+import logging.config
 import os
 import time
 from typing import List, Optional
 
 import motor.motor_asyncio
 from bson import ObjectId
+from fastapi import Request
 from fastapi import Body, FastAPI, HTTPException, status
 from fastapi_cache import FastAPICache
 from fastapi_cache.backends.redis import RedisBackend
@@ -27,8 +29,8 @@ app.add_middleware(
     logger=logger,
 )
 
-DATABASE_URL = os.environ["MONGODB_URL"]
-DATABASE_NAME = os.environ["MONGODB_DATABASE_NAME"]
+DATABASE_URL = "mongodb://mongos_router:27030"
+DATABASE_NAME = "somedb"
 REDIS_URL = os.getenv("REDIS_URL", None)
 
 
@@ -77,6 +79,13 @@ class UserCollection(BaseModel):
 
     users: List[UserModel]
 
+@app.middleware("http")
+async def add_query_time(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    elapsed = round((time.time() - start) * 1000, 2)
+    response.headers["X-Query-Time"] = str(elapsed)
+    return response
 
 @app.get("/")
 async def root():
@@ -102,8 +111,40 @@ async def root():
     if topology_type == "Sharded":
         shards_list = await client.admin.command("listShards")
         shards = {}
-        for shard in shards_list.get("shards", {}):
-            shards[shard["_id"]] = shard["host"]
+
+        for shard in shards_list.get("shards", []):
+            shard_name = shard["_id"]
+            shard_host = shard["host"]
+
+            host_str = shard_host.split("/")[1] if "/" in shard_host else shard_host
+            shard_client = motor.motor_asyncio.AsyncIOMotorClient(host_str)
+            replica_count = 1
+            total_docs = 0
+
+            try:
+                repl_status = await shard_client.admin.command("replSetGetStatus")
+                members = repl_status.get("members", [])
+                replica_count = len(members)
+                replicas = [{"name": m["name"], "state": m["stateStr"]} for m in members]
+            except Exception:
+                replicas = []
+
+            try:
+                shard_db = shard_client[DATABASE_NAME]
+                for collection_name in collection_names:
+                    total_docs += await shard_db[collection_name].count_documents({})
+            except Exception:
+                replicas = []
+                total_docs = 0
+            finally:
+                shard_client.close()
+
+            shards[shard_name] = {
+                "host": shard["host"],
+                "documents_count": total_docs,
+                "replica_count": replica_count,
+                "replicas": replicas
+            }
 
     cache_enabled = False
     if REDIS_URL:
@@ -134,7 +175,6 @@ async def collection_count(collection_name: str):
     # import ipdb; ipdb.set_trace()
     return {"status": "OK", "mongo_db": DATABASE_NAME, "items_count": items_count}
 
-
 @app.get(
     "/{collection_name}/users",
     response_description="List all users",
@@ -150,7 +190,6 @@ async def list_users(collection_name: str):
     time.sleep(1)
     collection = db.get_collection(collection_name)
     return UserCollection(users=await collection.find().to_list(1000))
-
 
 @app.get(
     "/{collection_name}/users/{name}",

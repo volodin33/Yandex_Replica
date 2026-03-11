@@ -1,3 +1,5 @@
+sh.enableSharding(db.getName());
+
 db.createCollection("products", {
   validator: {
     $jsonSchema: {
